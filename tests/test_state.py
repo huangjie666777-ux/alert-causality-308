@@ -159,3 +159,26 @@ def test_targets_are_isolated():
     # failure of tb must not touch ta's firing alert
     assert sm.process_failure("tb", now=1.0) == []
     assert len(sm.snapshot("ta", 1.0, 1000.0)) == 1
+
+
+def test_checkpoint_restore_rolls_back_state():
+    sm = AlertStateMachine([make_rule(duration_seconds=0.0)])
+    sm.process_round("t1", [sample(5.0)], now=0.0)  # below threshold, no state
+    checkpoint = sm.checkpoint()
+    events = sm.process_round("t1", [sample(20.0)], now=1.0)
+    assert kinds(events) == ["firing"]
+    sm.restore(checkpoint)
+    assert sm.snapshot("t1", 2.0, 1000.0) == []
+    # the firing is recomputed after the rollback instead of being lost
+    events = sm.process_round("t1", [sample(20.0)], now=2.0)
+    assert kinds(events) == ["firing"]
+
+
+def test_snapshot_without_target_covers_all_targets():
+    rule_a = make_rule(id="ra", target_id="ta", duration_seconds=0.0)
+    rule_b = make_rule(id="rb", target_id="tb", duration_seconds=0.0)
+    sm = AlertStateMachine([rule_a, rule_b])
+    sm.process_round("ta", [sample(20.0)], now=0.0)
+    sm.process_round("tb", [sample(20.0)], now=0.0)
+    active = sm.snapshot(None, 1.0, 1000.0)
+    assert {a["rule_id"] for a in active} == {"ra", "rb"}

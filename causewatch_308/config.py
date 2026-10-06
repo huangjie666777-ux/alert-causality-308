@@ -26,7 +26,23 @@ _LABEL_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 _TOP_KEYS = {"host", "port", "sqlite_path", "targets", "rules"}
 _TARGET_KEYS = {"id", "url", "interval_seconds", "timeout_seconds", "max_response_bytes"}
-_RULE_KEYS = {"id", "target_id", "metric", "labels", "threshold", "duration_seconds"}
+_RULE_KEYS = {
+    "id", "target_id", "metric", "labels", "threshold", "duration_seconds",
+    "depends_on",
+}
+_DEPENDENCY_KEYS = {"rule_id", "labels"}
+
+
+@dataclass(frozen=True)
+class DependencyConfig:
+    """One upstream rule this rule depends on, plus the correlation labels.
+
+    Two firing instances are linked only when every correlation label is
+    present and equal on both instances; the label list must be non-empty.
+    """
+
+    rule_id: str
+    labels: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -46,6 +62,7 @@ class RuleConfig:
     labels: dict[str, str]
     threshold: float
     duration_seconds: float
+    depends_on: tuple[DependencyConfig, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -113,6 +130,26 @@ def _parse_target(raw: object, path: str) -> TargetConfig:
     )
 
 
+def _parse_dependency(raw: object, path: str, own_rule_id: str) -> DependencyConfig:
+    if not isinstance(raw, dict):
+        raise _err(path, "must be an object")
+    _check_unknown_keys(raw, _DEPENDENCY_KEYS, path)
+    rule_id = _require_str(raw.get("rule_id"), f"{path}.rule_id")
+    if rule_id == own_rule_id:
+        raise _err(f"{path}.rule_id", "a rule cannot depend on itself")
+    labels = raw.get("labels")
+    if not isinstance(labels, list) or not labels:
+        raise _err(f"{path}.labels", "must be a non-empty array of label names")
+    clean: list[str] = []
+    for i, name in enumerate(labels):
+        if not isinstance(name, str) or not _LABEL_NAME_RE.match(name):
+            raise _err(f"{path}.labels[{i}]", f"invalid label name {name!r}")
+        if name in clean:
+            raise _err(f"{path}.labels", f"duplicate label name {name!r}")
+        clean.append(name)
+    return DependencyConfig(rule_id=rule_id, labels=tuple(clean))
+
+
 def _parse_rule(raw: object, path: str, target_ids: set[str]) -> RuleConfig:
     if not isinstance(raw, dict):
         raise _err(path, "must be an object")
@@ -138,6 +175,16 @@ def _parse_rule(raw: object, path: str, target_ids: set[str]) -> RuleConfig:
     duration = _require_number(raw.get("duration_seconds"), f"{path}.duration_seconds")
     if duration < 0:
         raise _err(f"{path}.duration_seconds", "must be >= 0")
+    raw_deps = raw.get("depends_on", [])
+    if not isinstance(raw_deps, list):
+        raise _err(f"{path}.depends_on", "must be an array")
+    deps = tuple(
+        _parse_dependency(d, f"{path}.depends_on[{i}]", rule_id)
+        for i, d in enumerate(raw_deps)
+    )
+    dep_rule_ids = [d.rule_id for d in deps]
+    if len(set(dep_rule_ids)) != len(dep_rule_ids):
+        raise _err(f"{path}.depends_on", "duplicate dependency edge(s)")
     return RuleConfig(
         id=rule_id,
         target_id=target_id,
@@ -145,7 +192,39 @@ def _parse_rule(raw: object, path: str, target_ids: set[str]) -> RuleConfig:
         labels=clean_labels,
         threshold=threshold,
         duration_seconds=duration,
+        depends_on=deps,
     )
+
+
+def _check_dependency_graph(rules: tuple[RuleConfig, ...]) -> None:
+    """Validate cross-rule references and reject dependency cycles."""
+    rule_ids = {r.id for r in rules}
+    for rule in rules:
+        for dep in rule.depends_on:
+            if dep.rule_id not in rule_ids:
+                raise _err(
+                    "rules",
+                    f"rule {rule.id!r} depends on unknown rule {dep.rule_id!r}",
+                )
+    graph = {r.id: [d.rule_id for d in r.depends_on] for r in rules}
+    state: dict[str, int] = {}  # 1 = on the current DFS path, 2 = fully explored
+    stack: list[str] = []
+
+    def visit(node: str) -> None:
+        state[node] = 1
+        stack.append(node)
+        for nxt in graph[node]:
+            if state.get(nxt) == 1:
+                cycle = " -> ".join(stack[stack.index(nxt):] + [nxt])
+                raise _err("rules", f"dependency cycle detected: {cycle}")
+            if state.get(nxt) != 2:
+                visit(nxt)
+        stack.pop()
+        state[node] = 2
+
+    for rule_id in graph:
+        if state.get(rule_id) != 2:
+            visit(rule_id)
 
 
 def parse_config(data: object) -> AppConfig:
@@ -180,6 +259,7 @@ def parse_config(data: object) -> AppConfig:
     rule_ids = [r.id for r in rules]
     if len(set(rule_ids)) != len(rule_ids):
         raise _err("rules", "rule ids must be unique")
+    _check_dependency_graph(rules)
 
     return AppConfig(
         host=host,

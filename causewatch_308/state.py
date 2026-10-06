@@ -20,6 +20,8 @@ from .parser import Sample
 
 KIND_FIRING = "firing"
 KIND_RESOLVED = "resolved"
+KIND_SUPPRESSED = "suppressed"
+KIND_UNSUPPRESSED = "unsuppressed"
 
 REASON_RECOVERED = "recovered"
 REASON_SERIES_MISSING = "series_missing"
@@ -32,11 +34,12 @@ _STATE_FIRING = "firing"
 
 @dataclass
 class AlertEvent:
-    kind: str  # KIND_FIRING | KIND_RESOLVED
+    kind: str  # KIND_FIRING | KIND_RESOLVED | KIND_SUPPRESSED | KIND_UNSUPPRESSED
     rule: RuleConfig
     labels: dict[str, str]
     value: float | None
     reason: str | None
+    details: dict | None = None  # e.g. {"sources": [...]} on suppressed events
 
 
 @dataclass
@@ -56,6 +59,25 @@ class AlertStateMachine:
         for rule in rules:
             self._rules_by_target.setdefault(rule.target_id, []).append(rule)
         self._states: dict[tuple[str, tuple[tuple[str, str], ...]], _AlertState] = {}
+
+    def checkpoint(self) -> dict:
+        """Snapshot the in-memory states so a failed persist can roll back.
+
+        The engine checkpoints before evaluating a round and restores the
+        checkpoint when the database write fails, so a lost write never
+        advances the state machine (which would silently drop events).
+        """
+        return {
+            key: _AlertState(s.rule, dict(s.labels), s.state, s.since, s.value)
+            for key, s in self._states.items()
+        }
+
+    def restore(self, checkpoint: dict) -> None:
+        """Roll the in-memory states back to a previous checkpoint."""
+        self._states = {
+            key: _AlertState(s.rule, dict(s.labels), s.state, s.since, s.value)
+            for key, s in checkpoint.items()
+        }
 
     def process_round(
         self, target_id: str, samples: list[Sample], now: float
@@ -132,12 +154,12 @@ class AlertStateMachine:
         return events
 
     def snapshot(
-        self, target_id: str, now_mono: float, now_wall: float
+        self, target_id: str | None, now_mono: float, now_wall: float
     ) -> list[dict]:
-        """Return the active alerts of one target as persistable dicts."""
+        """Return active alerts as persistable dicts (all targets if None)."""
         out = []
         for state in self._states.values():
-            if state.rule.target_id != target_id:
+            if target_id is not None and state.rule.target_id != target_id:
                 continue
             out.append(
                 {

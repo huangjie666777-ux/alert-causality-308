@@ -1,4 +1,4 @@
-"""HTTP query API: target health, latest samples, active alerts, events."""
+"""HTTP query API: target health, latest samples, alerts, firings, events."""
 
 from __future__ import annotations
 
@@ -56,6 +56,12 @@ async def list_alerts(request: web.Request) -> web.Response:
     return web.json_response({"alerts": store.active_alerts()})
 
 
+async def list_firing(request: web.Request) -> web.Response:
+    """Actionable alerts: firing instances that are not suppressed."""
+    store: Store = request.app[STORE_KEY]
+    return web.json_response({"alerts": store.actionable_firings()})
+
+
 async def list_events(request: web.Request) -> web.Response:
     store: Store = request.app[STORE_KEY]
     try:
@@ -84,5 +90,6 @@ def make_app(config: AppConfig, store: Store) -> web.Application:
     app.router.add_get("/api/targets", list_targets)
     app.router.add_get("/api/targets/{target_id}/samples", target_samples)
     app.router.add_get("/api/alerts", list_alerts)
+    app.router.add_get("/api/firing", list_firing)
     app.router.add_get("/api/events", list_events)
     return app
