@@ -1,10 +1,11 @@
 """JSON configuration loading and startup validation.
 
 The configuration file describes the local listen address, the SQLite path,
-the scrape targets and the alert rules.  Everything is validated eagerly at
-startup so a misconfigured process fails fast with a clear message instead of
-misbehaving at runtime.  There is intentionally no PromQL, no notification
-and no frontend configuration.
+the scrape targets, the alert rules and the rule dependencies used for
+suppression.  Everything is validated eagerly at startup so a misconfigured
+process fails fast with a clear message instead of misbehaving at runtime.
+There is intentionally no PromQL, no notification and no frontend
+configuration.
 """
 
 from __future__ import annotations
@@ -24,9 +25,10 @@ class ConfigError(ValueError):
 _METRIC_NAME_RE = re.compile(r"^[a-zA-Z_:][a-zA-Z0-9_:]*$")
 _LABEL_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
-_TOP_KEYS = {"host", "port", "sqlite_path", "targets", "rules"}
+_TOP_KEYS = {"host", "port", "sqlite_path", "targets", "rules", "dependencies"}
 _TARGET_KEYS = {"id", "url", "interval_seconds", "timeout_seconds", "max_response_bytes"}
 _RULE_KEYS = {"id", "target_id", "metric", "labels", "threshold", "duration_seconds"}
+_DEPENDENCY_KEYS = {"upstream", "downstream", "labels"}
 
 
 @dataclass(frozen=True)
@@ -49,16 +51,30 @@ class RuleConfig:
 
 
 @dataclass(frozen=True)
+class DependencyConfig:
+    """An edge upstream rule -> downstream rule linked by correlation labels."""
+
+    upstream: str
+    downstream: str
+    labels: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class AppConfig:
     host: str
     port: int
     sqlite_path: Path
     targets: tuple[TargetConfig, ...]
     rules: tuple[RuleConfig, ...]
+    dependencies: tuple[DependencyConfig, ...] = ()
 
     @property
     def targets_by_id(self) -> dict[str, TargetConfig]:
         return {t.id: t for t in self.targets}
+
+    @property
+    def rules_by_id(self) -> dict[str, RuleConfig]:
+        return {r.id: r for r in self.rules}
 
 
 def _err(path: str, msg: str) -> ConfigError:
@@ -148,6 +164,68 @@ def _parse_rule(raw: object, path: str, target_ids: set[str]) -> RuleConfig:
     )
 
 
+def _parse_dependency(raw: object, path: str, rule_ids: set[str]) -> DependencyConfig:
+    if not isinstance(raw, dict):
+        raise _err(path, "must be an object")
+    _check_unknown_keys(raw, _DEPENDENCY_KEYS, path)
+    upstream = _require_str(raw.get("upstream"), f"{path}.upstream")
+    downstream = _require_str(raw.get("downstream"), f"{path}.downstream")
+    if upstream not in rule_ids:
+        raise _err(f"{path}.upstream", f"references unknown rule {upstream!r}")
+    if downstream not in rule_ids:
+        raise _err(f"{path}.downstream", f"references unknown rule {downstream!r}")
+    if upstream == downstream:
+        raise _err(path, "a rule cannot depend on itself")
+    labels = raw.get("labels")
+    if not isinstance(labels, list) or not labels:
+        raise _err(f"{path}.labels", "must be a non-empty array of label names")
+    clean_labels: list[str] = []
+    for index, name in enumerate(labels):
+        if not isinstance(name, str) or not _LABEL_NAME_RE.match(name):
+            raise _err(f"{path}.labels[{index}]", f"invalid label name {name!r}")
+        if name in clean_labels:
+            raise _err(f"{path}.labels", f"duplicate label name {name!r}")
+        clean_labels.append(name)
+    return DependencyConfig(
+        upstream=upstream, downstream=downstream, labels=tuple(clean_labels)
+    )
+
+
+def _check_dependency_graph(dependencies: tuple[DependencyConfig, ...]) -> None:
+    """Reject duplicate edges and cycles in the rule dependency graph."""
+    seen: set[tuple[str, str]] = set()
+    adjacency: dict[str, list[str]] = {}
+    for dep in dependencies:
+        edge = (dep.upstream, dep.downstream)
+        if edge in seen:
+            raise _err(
+                "dependencies",
+                f"duplicate edge {dep.upstream!r} -> {dep.downstream!r}",
+            )
+        seen.add(edge)
+        adjacency.setdefault(dep.upstream, []).append(dep.downstream)
+
+    visiting: list[str] = []
+    done: set[str] = set()
+
+    def visit(node: str) -> None:
+        if node in done:
+            return
+        if node in visiting:
+            cycle = visiting[visiting.index(node):] + [node]
+            raise _err(
+                "dependencies", "dependency cycle detected: " + " -> ".join(cycle)
+            )
+        visiting.append(node)
+        for nxt in adjacency.get(node, []):
+            visit(nxt)
+        visiting.pop()
+        done.add(node)
+
+    for node in list(adjacency):
+        visit(node)
+
+
 def parse_config(data: object) -> AppConfig:
     """Validate a decoded JSON document and return the typed configuration."""
     if not isinstance(data, dict):
@@ -181,12 +259,22 @@ def parse_config(data: object) -> AppConfig:
     if len(set(rule_ids)) != len(rule_ids):
         raise _err("rules", "rule ids must be unique")
 
+    raw_dependencies = data.get("dependencies", [])
+    if not isinstance(raw_dependencies, list):
+        raise _err("dependencies", "must be an array")
+    dependencies = tuple(
+        _parse_dependency(d, f"dependencies[{i}]", set(rule_ids))
+        for i, d in enumerate(raw_dependencies)
+    )
+    _check_dependency_graph(dependencies)
+
     return AppConfig(
         host=host,
         port=port,
         sqlite_path=Path(sqlite_path),
         targets=targets,
         rules=rules,
+        dependencies=dependencies,
     )
 
 

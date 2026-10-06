@@ -2,14 +2,20 @@
 
 Each scrape round is persisted in a single transaction: the round row, the
 replacement of the target's samples (successful rounds only), the mirror of
-the target's active alert states and all firing/resolved events are written
-atomically.  Event ids come from an AUTOINCREMENT primary key, so they are
-stable and monotonically increasing, which is what the id-based pagination of
-the events API relies on.
+the active alert states of *all* targets including the suppression snapshot
+(suppressed flag, direct suppressors and root causes) and all events of the
+round (firing/resolved/suppressed/unsuppressed) are written atomically.
+Event ids come from an AUTOINCREMENT primary key, so they are stable and
+monotonically increasing, which is what the id-based pagination of the
+events API relies on.
 
 On startup, history (rounds/samples/events) is preserved, every pending
 alert is dropped and every previously firing alert is resolved exactly once
-with reason ``restart`` -- downtime never accumulates into alert durations.
+with reason ``restart`` -- downtime never accumulates into alert durations
+and no suppression survives a restart.
+
+Databases created by older versions (without the suppression columns on the
+alerts table) are migrated in place on open.
 """
 
 from __future__ import annotations
@@ -56,6 +62,9 @@ CREATE TABLE IF NOT EXISTS alerts (
     since_wall REAL NOT NULL,
     value REAL,
     threshold REAL NOT NULL,
+    suppressed INTEGER NOT NULL DEFAULT 0,
+    suppressed_by TEXT NOT NULL DEFAULT '[]',
+    root_causes TEXT NOT NULL DEFAULT '[]',
     PRIMARY KEY (rule_id, labels_key)
 );
 
@@ -82,9 +91,31 @@ class Store:
         self._conn = sqlite3.connect(self._path)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
+        self._migrate()
 
     def close(self) -> None:
         self._conn.close()
+
+    def _migrate(self) -> None:
+        """Add suppression columns to databases created by older versions."""
+        columns = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(alerts)")
+        }
+        additions = {
+            "suppressed":
+                "ALTER TABLE alerts ADD COLUMN suppressed"
+                " INTEGER NOT NULL DEFAULT 0",
+            "suppressed_by":
+                "ALTER TABLE alerts ADD COLUMN suppressed_by"
+                " TEXT NOT NULL DEFAULT '[]'",
+            "root_causes":
+                "ALTER TABLE alerts ADD COLUMN root_causes"
+                " TEXT NOT NULL DEFAULT '[]'",
+        }
+        for name, ddl in additions.items():
+            if name not in columns:
+                self._conn.execute(ddl)
+        self._conn.commit()
 
     # ------------------------------------------------------------------
     # startup recovery
@@ -168,11 +199,14 @@ class Store:
                         for s in samples
                     ],
                 )
-            self._conn.execute("DELETE FROM alerts WHERE target_id = ?", (target_id,))
+            # The alerts mirror is global: a round of one target can change
+            # the suppression state of alerts owned by other targets.
+            self._conn.execute("DELETE FROM alerts")
             self._conn.executemany(
                 "INSERT INTO alerts (rule_id, labels_key, target_id, metric,"
-                " labels, state, since_mono, since_wall, value, threshold)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                " labels, state, since_mono, since_wall, value, threshold,"
+                " suppressed, suppressed_by, root_causes)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 [
                     (
                         a["rule_id"],
@@ -185,6 +219,17 @@ class Store:
                         a["since_wall"],
                         a["value"],
                         a["threshold"],
+                        int(bool(a.get("suppressed", False))),
+                        json.dumps(
+                            a.get("suppressed_by", []),
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                        json.dumps(
+                            a.get("root_causes", []),
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
                     )
                     for a in active_alerts
                 ],
@@ -271,6 +316,9 @@ class Store:
                 "since": r["since_wall"],
                 "value": r["value"],
                 "threshold": r["threshold"],
+                "suppressed": bool(r["suppressed"]),
+                "suppressed_by": json.loads(r["suppressed_by"]),
+                "root_causes": json.loads(r["root_causes"]),
             }
             for r in rows
         ]

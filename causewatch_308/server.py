@@ -1,4 +1,9 @@
-"""HTTP query API: target health, latest samples, active alerts, events."""
+"""HTTP query API: target health, latest samples, active alerts, events.
+
+``/api/alerts`` returns every active alert (including suppressed ones, with
+their direct suppressors and traced root causes) plus the ``actionable``
+subset: the unsuppressed firing alerts an operator should handle first.
+"""
 
 from __future__ import annotations
 
@@ -53,7 +58,11 @@ async def target_samples(request: web.Request) -> web.Response:
 
 async def list_alerts(request: web.Request) -> web.Response:
     store: Store = request.app[STORE_KEY]
-    return web.json_response({"alerts": store.active_alerts()})
+    alerts = store.active_alerts()
+    actionable = [
+        a for a in alerts if a["state"] == "firing" and not a["suppressed"]
+    ]
+    return web.json_response({"alerts": alerts, "actionable": actionable})
 
 
 async def list_events(request: web.Request) -> web.Response:

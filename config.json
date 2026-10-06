@@ -19,6 +19,21 @@
       "labels": {"room": "server"},
       "threshold": 30,
       "duration_seconds": 3
+    },
+    {
+      "id": "demo-humidity-high",
+      "target_id": "demo-exporter",
+      "metric": "demo_humidity_percent",
+      "labels": {"room": "server"},
+      "threshold": 80,
+      "duration_seconds": 3
+    }
+  ],
+  "dependencies": [
+    {
+      "upstream": "demo-temperature-high",
+      "downstream": "demo-humidity-high",
+      "labels": ["room"]
     }
   ]
 }
