@@ -1,0 +1,300 @@
+"""SQLite persistence for rounds, samples, alert states and events.
+
+Each scrape round is persisted in a single transaction: the round row, the
+replacement of the target's samples (successful rounds only), the mirror of
+the target's active alert states and all firing/resolved events are written
+atomically.  Event ids come from an AUTOINCREMENT primary key, so they are
+stable and monotonically increasing, which is what the id-based pagination of
+the events API relies on.
+
+On startup, history (rounds/samples/events) is preserved, every pending
+alert is dropped and every previously firing alert is resolved exactly once
+with reason ``restart`` -- downtime never accumulates into alert durations.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import time
+from pathlib import Path
+
+from .labels import canonical_key, to_json
+from .state import KIND_FIRING, KIND_RESOLVED, REASON_RESTART
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS rounds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_id TEXT NOT NULL,
+    ts REAL NOT NULL,
+    ok INTEGER NOT NULL,
+    error TEXT,
+    sample_count INTEGER NOT NULL,
+    duration_ms REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rounds_target ON rounds(target_id, id);
+
+CREATE TABLE IF NOT EXISTS samples (
+    target_id TEXT NOT NULL,
+    metric TEXT NOT NULL,
+    labels_key TEXT NOT NULL,
+    labels TEXT NOT NULL,
+    value REAL NOT NULL,
+    round_id INTEGER NOT NULL,
+    scraped_at REAL NOT NULL,
+    PRIMARY KEY (target_id, metric, labels_key)
+);
+
+CREATE TABLE IF NOT EXISTS alerts (
+    rule_id TEXT NOT NULL,
+    labels_key TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    metric TEXT NOT NULL,
+    labels TEXT NOT NULL,
+    state TEXT NOT NULL,
+    since_mono REAL NOT NULL,
+    since_wall REAL NOT NULL,
+    value REAL,
+    threshold REAL NOT NULL,
+    PRIMARY KEY (rule_id, labels_key)
+);
+
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    kind TEXT NOT NULL,
+    reason TEXT,
+    rule_id TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    metric TEXT NOT NULL,
+    labels TEXT NOT NULL,
+    value REAL,
+    threshold REAL NOT NULL
+);
+"""
+
+
+class Store:
+    def __init__(self, path: str | Path):
+        self._path = str(path)
+        if self._path != ":memory:":
+            Path(self._path).parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(self._path)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.executescript(SCHEMA)
+
+    def close(self) -> None:
+        self._conn.close()
+
+    # ------------------------------------------------------------------
+    # startup recovery
+    # ------------------------------------------------------------------
+    def startup_recovery(self, now_wall: float | None = None) -> int:
+        """Resolve leftover firing alerts as 'restart', drop pending ones."""
+        now_wall = time.time() if now_wall is None else now_wall
+        with self._conn:  # single transaction
+            rows = self._conn.execute(
+                "SELECT * FROM alerts WHERE state = ?", (KIND_FIRING,)
+            ).fetchall()
+            for row in rows:
+                self._conn.execute(
+                    "INSERT INTO events (ts, kind, reason, rule_id, target_id,"
+                    " metric, labels, value, threshold)"
+                    " VALUES (?,?,?,?,?,?,?,?,?)",
+                    (
+                        now_wall,
+                        KIND_RESOLVED,
+                        REASON_RESTART,
+                        row["rule_id"],
+                        row["target_id"],
+                        row["metric"],
+                        row["labels"],
+                        row["value"],
+                        row["threshold"],
+                    ),
+                )
+            self._conn.execute("DELETE FROM alerts")
+        return len(rows)
+
+    # ------------------------------------------------------------------
+    # round persistence (single transaction)
+    # ------------------------------------------------------------------
+    def save_round(
+        self,
+        target_id: str,
+        *,
+        ok: bool,
+        error: str | None,
+        samples,
+        events,
+        active_alerts,
+        duration_ms: float,
+        now_mono: float,
+        now_wall: float,
+    ) -> None:
+        del now_mono  # monotonic values are carried inside active_alerts
+        with self._conn:  # single transaction for the whole round
+            cur = self._conn.execute(
+                "INSERT INTO rounds (target_id, ts, ok, error, sample_count,"
+                " duration_ms) VALUES (?,?,?,?,?,?)",
+                (
+                    target_id,
+                    now_wall,
+                    int(ok),
+                    error,
+                    len(samples) if ok else 0,
+                    duration_ms,
+                ),
+            )
+            round_id = cur.lastrowid
+            if ok:
+                self._conn.execute(
+                    "DELETE FROM samples WHERE target_id = ?", (target_id,)
+                )
+                self._conn.executemany(
+                    "INSERT INTO samples (target_id, metric, labels_key,"
+                    " labels, value, round_id, scraped_at)"
+                    " VALUES (?,?,?,?,?,?,?)",
+                    [
+                        (
+                            target_id,
+                            s.metric,
+                            canonical_key(s.labels),
+                            to_json(s.labels),
+                            s.value,
+                            round_id,
+                            now_wall,
+                        )
+                        for s in samples
+                    ],
+                )
+            self._conn.execute("DELETE FROM alerts WHERE target_id = ?", (target_id,))
+            self._conn.executemany(
+                "INSERT INTO alerts (rule_id, labels_key, target_id, metric,"
+                " labels, state, since_mono, since_wall, value, threshold)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                [
+                    (
+                        a["rule_id"],
+                        canonical_key(a["labels"]),
+                        a["target_id"],
+                        a["metric"],
+                        to_json(a["labels"]),
+                        a["state"],
+                        a["since_mono"],
+                        a["since_wall"],
+                        a["value"],
+                        a["threshold"],
+                    )
+                    for a in active_alerts
+                ],
+            )
+            self._conn.executemany(
+                "INSERT INTO events (ts, kind, reason, rule_id, target_id,"
+                " metric, labels, value, threshold) VALUES (?,?,?,?,?,?,?,?,?)",
+                [
+                    (
+                        now_wall,
+                        e.kind,
+                        e.reason,
+                        e.rule.id,
+                        e.rule.target_id,
+                        e.rule.metric,
+                        to_json(e.labels),
+                        e.value,
+                        e.rule.threshold,
+                    )
+                    for e in events
+                ],
+            )
+
+    # ------------------------------------------------------------------
+    # queries used by the HTTP API
+    # ------------------------------------------------------------------
+    def targets_health(self) -> dict[str, dict]:
+        latest = self._conn.execute(
+            "SELECT r.* FROM rounds r"
+            " JOIN (SELECT target_id, MAX(id) AS max_id FROM rounds"
+            "       GROUP BY target_id) m"
+            "   ON r.target_id = m.target_id AND r.id = m.max_id"
+        ).fetchall()
+        out: dict[str, dict] = {}
+        for row in latest:
+            failures = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM rounds WHERE target_id = ? AND ok = 0"
+                " AND id > COALESCE("
+                "   (SELECT MAX(id) FROM rounds WHERE target_id = ? AND ok = 1), 0)",
+                (row["target_id"], row["target_id"]),
+            ).fetchone()["c"]
+            out[row["target_id"]] = {
+                "ok": bool(row["ok"]),
+                "error": row["error"],
+                "last_scrape_at": row["ts"],
+                "duration_ms": row["duration_ms"],
+                "sample_count": row["sample_count"],
+                "consecutive_failures": failures,
+            }
+        return out
+
+    def latest_samples(self, target_id: str) -> dict | None:
+        rows = self._conn.execute(
+            "SELECT metric, labels, value, round_id, scraped_at FROM samples"
+            " WHERE target_id = ? ORDER BY metric, labels_key",
+            (target_id,),
+        ).fetchall()
+        if not rows:
+            return None
+        return {
+            "round_id": rows[0]["round_id"],
+            "scraped_at": rows[0]["scraped_at"],
+            "samples": [
+                {
+                    "metric": r["metric"],
+                    "labels": json.loads(r["labels"]),
+                    "value": r["value"],
+                }
+                for r in rows
+            ],
+        }
+
+    def active_alerts(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM alerts ORDER BY rule_id, labels_key"
+        ).fetchall()
+        return [
+            {
+                "rule_id": r["rule_id"],
+                "target_id": r["target_id"],
+                "metric": r["metric"],
+                "labels": json.loads(r["labels"]),
+                "state": r["state"],
+                "since": r["since_wall"],
+                "value": r["value"],
+                "threshold": r["threshold"],
+            }
+            for r in rows
+        ]
+
+    def events_after(self, after_id: int, limit: int) -> tuple[list[dict], bool]:
+        rows = self._conn.execute(
+            "SELECT * FROM events WHERE id > ? ORDER BY id LIMIT ?",
+            (after_id, limit + 1),
+        ).fetchall()
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        events = [
+            {
+                "id": r["id"],
+                "ts": r["ts"],
+                "kind": r["kind"],
+                "reason": r["reason"],
+                "rule_id": r["rule_id"],
+                "target_id": r["target_id"],
+                "metric": r["metric"],
+                "labels": json.loads(r["labels"]),
+                "value": r["value"],
+                "threshold": r["threshold"],
+            }
+            for r in rows
+        ]
+        return events, has_more
